@@ -1,34 +1,42 @@
 #!/usr/bin/env python3
+import json
 import threading
 import time
-import json
+
 import paho.mqtt.client as mqtt
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import String  # swap for custom msgs later if needed
 from geometry_msgs.msg import Twist
 
 
 class IotMqttBridge(Node):
+    """
+    Simple bridge:
+      MQTT topic  : /ble/advertise/watch/espruino
+      MQTT payload: {"m":40,"x":0,"y":0,"s":1}
+      ROS topic   : /cmd_vel (geometry_msgs/Twist)
+    """
+
     def __init__(self):
         super().__init__("espruino_mqtt_bridge")
 
-        # --- Parameters for Mosquitto/MQTT ---
-        self.declare_parameter("mqtt_host", "localhost")      # Mosquitto host
-        self.declare_parameter("mqtt_port", 1883)             # Mosquitto port
-        self.declare_parameter("mqtt_username", "")           # optional
-        self.declare_parameter("mqtt_password", "")           # optional
-        self.declare_parameter("mqtt_use_tls", False)         # set True if using TLS
-        self.declare_parameter("mqtt_ca_cert", "")            # path to CA cert if TLS
+        # ---------- Parameters ----------
+        self.declare_parameter("mqtt_host", "localhost")
+        self.declare_parameter("mqtt_port", 1883)
+        self.declare_parameter("mqtt_username", "")
+        self.declare_parameter("mqtt_password", "")
+        self.declare_parameter("mqtt_use_tls", False)
+        self.declare_parameter("mqtt_ca_cert", "")
 
-        # EspruinoHub topic for the Bangle joystick:
+        # EspruinoHub joystick topic
         # e.g. /ble/advertise/watch/espruino -> {"m":40,"x":0,"y":0,"s":1}
-        self.declare_parameter("mqtt_joystick_topic",
-                               "/ble/advertise/watch/espruino")
+        self.declare_parameter(
+            "mqtt_joystick_topic", "/ble/advertise/watch/espruino"
+        )
 
         # Scale factors to map joystick units to velocities
-        self.declare_parameter("linear_scale", 0.01)   # m/s per unit of x
-        self.declare_parameter("angular_scale", 0.01)  # rad/s per unit of y
+        self.declare_parameter("linear_scale", 0.01)   # m/s per x unit
+        self.declare_parameter("angular_scale", 0.01)  # rad/s per y unit
 
         p = self.get_parameters([
             "mqtt_host", "mqtt_port", "mqtt_username", "mqtt_password",
@@ -53,7 +61,7 @@ class IotMqttBridge(Node):
             f"'{self.joystick_topic}' to ROS topic '/cmd_vel'"
         )
 
-        # --- MQTT client setup (for Mosquitto) ---
+        # ---------- MQTT client ----------
         self.mqtt_client = mqtt.Client()
 
         if self.mqtt_username:
@@ -94,21 +102,13 @@ class IotMqttBridge(Node):
                         return
                     time.sleep(0.1)
 
-    def _sleep(self, seconds: float):
-        # Simple ROS-friendly sleep
-        rate = self.create_rate(1.0)
-        for _ in range(int(seconds)):
-            if not rclpy.ok():
-                break
-            rate.sleep()
-
     def _on_mqtt_connect(self, client, userdata, flags, rc):
         if rc == 0:
             self.get_logger().info("Connected to Mosquitto broker.")
-            for dev_id in self.device_ids:
-                topic = f"{self.base_topic}/{dev_id}/data"
-                client.subscribe(topic)
-                self.get_logger().info(f"Subscribed to MQTT topic {topic}")
+            client.subscribe(self.joystick_topic)
+            self.get_logger().info(
+                f"Subscribed to joystick topic: {self.joystick_topic}"
+            )
         else:
             self.get_logger().error(f"Failed to connect to MQTT, rc={rc}")
 
@@ -116,7 +116,7 @@ class IotMqttBridge(Node):
         payload = msg.payload.decode("utf-8", errors="ignore")
         self.get_logger().debug(f"MQTT message on {msg.topic}: {payload}")
 
-        # Expecting JSON from EspruinoHub: {"m":40,"x":0,"y":0,"s":1}
+        # Expect JSON from EspruinoHub like: {"m":40,"x":0,"y":0,"s":1}
         try:
             data = json.loads(payload)
         except json.JSONDecodeError as e:
@@ -126,7 +126,7 @@ class IotMqttBridge(Node):
         # x = forward/back, y = left/right steer
         x_raw = float(data.get("x", 0.0))
         y_raw = float(data.get("y", 0.0))
-        # s = mode (0/1) is available as data.get("s") if you want it
+        # s = mode flag, available as data.get("s") if you want to use it
 
         twist = Twist()
         twist.linear.x = x_raw * self.linear_scale
@@ -138,6 +138,7 @@ class IotMqttBridge(Node):
             f"cmd_vel: linear.x={twist.linear.x:.3f}, "
             f"angular.z={twist.angular.z:.3f}"
         )
+
 
 def main(args=None):
     rclpy.init(args=args)
