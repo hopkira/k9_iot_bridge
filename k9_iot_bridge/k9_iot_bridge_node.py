@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 import threading
-
+import time
+import json
 import paho.mqtt.client as mqtt
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String  # swap for custom msgs later if needed
+from geometry_msgs.msg import Twist
 
 
 class IotMqttBridge(Node):
@@ -19,12 +21,19 @@ class IotMqttBridge(Node):
         self.declare_parameter("mqtt_use_tls", False)         # set True if using TLS
         self.declare_parameter("mqtt_ca_cert", "")            # path to CA cert if TLS
 
-        self.declare_parameter("mqtt_base_topic", "espruino/devices")
-        self.declare_parameter("device_ids", ["puck1"])
+        # EspruinoHub topic for the Bangle joystick:
+        # e.g. /ble/advertise/watch/espruino -> {"m":40,"x":0,"y":0,"s":1}
+        self.declare_parameter("mqtt_joystick_topic",
+                               "/ble/advertise/watch/espruino")
+
+        # Scale factors to map joystick units to velocities
+        self.declare_parameter("linear_scale", 0.01)   # m/s per unit of x
+        self.declare_parameter("angular_scale", 0.01)  # rad/s per unit of y
 
         p = self.get_parameters([
             "mqtt_host", "mqtt_port", "mqtt_username", "mqtt_password",
-            "mqtt_use_tls", "mqtt_ca_cert", "mqtt_base_topic", "device_ids"
+            "mqtt_use_tls", "mqtt_ca_cert", "mqtt_joystick_topic",
+            "linear_scale", "angular_scale",
         ])
 
         self.mqtt_host = p[0].value
@@ -33,48 +42,35 @@ class IotMqttBridge(Node):
         self.mqtt_password = p[3].value
         self.mqtt_use_tls = bool(p[4].value)
         self.mqtt_ca_cert = p[5].value
-        self.base_topic = p[6].value
-        self.device_ids = list(p[7].value)
+        self.joystick_topic = p[6].value
+        self.linear_scale = float(p[7].value)
+        self.angular_scale = float(p[8].value)
 
-        # --- ROS publishers (MQTT -> ROS) ---
-        self.data_publishers = {}
-        for dev_id in self.device_ids:
-            ros_topic = f"/puck/{dev_id}/data"
-            self.data_publishers[dev_id] = self.create_publisher(String, ros_topic, 10)
-            self.get_logger().info(
-                f"Publishing MQTT data for {dev_id} to ROS topic {ros_topic}"
-            )
-
-        # --- ROS subscribers (ROS -> MQTT) ---
-        for dev_id in self.device_ids:
-            ros_cmd_topic = f"/puck/{dev_id}/cmd"
-            self.create_subscription(
-                String,
-                ros_cmd_topic,
-                lambda msg, dev_id=dev_id: self._handle_ros_cmd(dev_id, msg),
-                10,
-            )
-            self.get_logger().info(
-                f"Subscribing to ROS commands for {dev_id} on {ros_cmd_topic}"
-            )
+        # ---------- ROS publisher ----------
+        self.cmd_vel_pub = self.create_publisher(Twist, "/cmd_vel", 10)
+        self.get_logger().info(
+            f"Publishing joystick data from MQTT topic "
+            f"'{self.joystick_topic}' to ROS topic '/cmd_vel'"
+        )
 
         # --- MQTT client setup (for Mosquitto) ---
         self.mqtt_client = mqtt.Client()
 
         if self.mqtt_username:
-            self.mqtt_client.username_pw_set(self.mqtt_username, self.mqtt_password)
+            self.mqtt_client.username_pw_set(
+                self.mqtt_username, self.mqtt_password
+            )
 
         if self.mqtt_use_tls:
-            # if mqtt_ca_cert is empty, it will use system CAs
             if self.mqtt_ca_cert:
                 self.mqtt_client.tls_set(ca_certs=self.mqtt_ca_cert)
             else:
-                self.mqtt_client.tls_set()  # default system CA
+                self.mqtt_client.tls_set()
 
         self.mqtt_client.on_connect = self._on_mqtt_connect
         self.mqtt_client.on_message = self._on_mqtt_message
 
-        # Start MQTT loop in a separate thread
+        # Run MQTT loop in background thread
         self.mqtt_thread = threading.Thread(
             target=self._mqtt_thread_fn, daemon=True
         )
@@ -93,7 +89,10 @@ class IotMqttBridge(Node):
             except Exception as e:
                 self.get_logger().error(f"MQTT connection error: {e}")
                 self.get_logger().info("Reconnecting to Mosquitto in 5 seconds...")
-                self._sleep(5.0)
+                for _ in range(50):
+                    if not rclpy.ok():
+                        return
+                    time.sleep(0.1)
 
     def _sleep(self, seconds: float):
         # Simple ROS-friendly sleep
@@ -114,31 +113,31 @@ class IotMqttBridge(Node):
             self.get_logger().error(f"Failed to connect to MQTT, rc={rc}")
 
     def _on_mqtt_message(self, client, userdata, msg):
-        topic = msg.topic
         payload = msg.payload.decode("utf-8", errors="ignore")
-        self.get_logger().debug(f"MQTT message on {topic}: {payload}")
+        self.get_logger().debug(f"MQTT message on {msg.topic}: {payload}")
 
-        # Expected format: espruino/devices/<id>/data
-        parts = topic.split("/")
-        if len(parts) >= 3 and parts[0] == "espruino" and parts[1] == "devices":
-            dev_id = parts[2]
-            pub = self.data_publishers.get(dev_id)
-            if pub is not None:
-                ros_msg = String()
-                ros_msg.data = payload
-                pub.publish(ros_msg)
-
-    # ---------- ROS -> MQTT ----------
-
-    def _handle_ros_cmd(self, dev_id: str, msg: String):
-        topic = f"{self.base_topic}/{dev_id}/cmd"
-        payload = msg.data
+        # Expecting JSON from EspruinoHub: {"m":40,"x":0,"y":0,"s":1}
         try:
-            self.mqtt_client.publish(topic, payload)
-            self.get_logger().info(f"Published command to {topic}: {payload}")
-        except Exception as e:
-            self.get_logger().error(f"Failed to publish MQTT command: {e}")
+            data = json.loads(payload)
+        except json.JSONDecodeError as e:
+            self.get_logger().warn(f"Failed to parse joystick JSON: {e}")
+            return
 
+        # x = forward/back, y = left/right steer
+        x_raw = float(data.get("x", 0.0))
+        y_raw = float(data.get("y", 0.0))
+        # s = mode (0/1) is available as data.get("s") if you want it
+
+        twist = Twist()
+        twist.linear.x = x_raw * self.linear_scale
+        twist.angular.z = y_raw * self.angular_scale
+
+        self.cmd_vel_pub.publish(twist)
+
+        self.get_logger().debug(
+            f"cmd_vel: linear.x={twist.linear.x:.3f}, "
+            f"angular.z={twist.angular.z:.3f}"
+        )
 
 def main(args=None):
     rclpy.init(args=args)
