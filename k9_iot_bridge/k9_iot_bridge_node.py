@@ -8,6 +8,52 @@ import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
 
+def parse_joystick_payload(payload: str):
+    """
+    Try JSON first; if that fails, parse EspruinoHub-style
+    object like {m:40,x:0,y:0,s:1}.
+    """
+    payload = payload.strip()
+    # First try normal JSON
+    try:
+        return json.loads(payload)
+    except json.JSONDecodeError:
+        pass
+
+    # Fallback: very simple parser for {m:40,x:0,y:0,s:1}
+    if payload.startswith("{") and payload.endswith("}"):
+        payload = payload[1:-1]
+
+    result = {}
+    if not payload:
+        return result
+
+    for part in payload.split(","):
+        if ":" not in part:
+            continue
+        k, v = part.split(":", 1)
+        key = k.strip().strip('"').strip("'")
+        val = v.strip()
+
+        # Try bool
+        if val.lower() in ("true", "false"):
+            result[key] = (val.lower() == "true")
+            continue
+
+        # Try number
+        try:
+            num = float(val)
+            result[key] = int(num) if num.is_integer() else num
+            continue
+        except ValueError:
+            pass
+
+        # Fall back to string
+        result[key] = val.strip('"').strip("'")
+
+    return result
+
+
 
 class IotMqttBridge(Node):
     """
@@ -115,17 +161,14 @@ class IotMqttBridge(Node):
         payload = msg.payload.decode("utf-8", errors="ignore")
         self.get_logger().debug(f"MQTT message on {msg.topic}: {payload}")
 
-        # Expect JSON from EspruinoHub like: {"m":40,"x":0,"y":0,"s":1}
-        try:
-            data = json.loads(payload)
-        except json.JSONDecodeError as e:
-            self.get_logger().warn(f"Failed to parse joystick JSON: {e}")
+        # Accept either proper JSON or Espruino-style {m:40,x:0,y:0,s:1}
+        data = parse_joystick_payload(payload)
+        if not data:
+            self.get_logger().warn("Joystick payload was empty or unparseable")
             return
 
-        # x = forward/back, y = left/right steer
         x_raw = float(data.get("x", 0.0))
         y_raw = float(data.get("y", 0.0))
-        # s = mode flag, available as data.get("s") if you want it
 
         twist = Twist()
         twist.linear.x = x_raw * self.linear_scale
