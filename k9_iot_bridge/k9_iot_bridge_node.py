@@ -29,7 +29,6 @@ class IotMqttBridge(Node):
         self.declare_parameter("mqtt_ca_cert", "")
 
         # EspruinoHub joystick topic
-        # e.g. /ble/advertise/watch/espruino -> {"m":40,"x":0,"y":0,"s":1}
         self.declare_parameter(
             "mqtt_joystick_topic", "/ble/advertise/watch/espruino"
         )
@@ -90,13 +89,13 @@ class IotMqttBridge(Node):
         while rclpy.ok():
             try:
                 self.get_logger().info(
-                    f"Connecting to Mosquitto at {self.mqtt_host}:{self.mqtt_port}"
+                    f"Connecting to MQTT broker at {self.mqtt_host}:{self.mqtt_port}"
                 )
                 self.mqtt_client.connect(self.mqtt_host, self.mqtt_port, 60)
                 self.mqtt_client.loop_forever()
             except Exception as e:
                 self.get_logger().error(f"MQTT connection error: {e}")
-                self.get_logger().info("Reconnecting to Mosquitto in 5 seconds...")
+                self.get_logger().info("Reconnecting to MQTT in 5 seconds...")
                 for _ in range(50):
                     if not rclpy.ok():
                         return
@@ -104,7 +103,7 @@ class IotMqttBridge(Node):
 
     def _on_mqtt_connect(self, client, userdata, flags, rc):
         if rc == 0:
-            self.get_logger().info("Connected to Mosquitto broker.")
+            self.get_logger().info("Connected to MQTT broker.")
             client.subscribe(self.joystick_topic)
             self.get_logger().info(
                 f"Subscribed to joystick topic: {self.joystick_topic}"
@@ -126,7 +125,7 @@ class IotMqttBridge(Node):
         # x = forward/back, y = left/right steer
         x_raw = float(data.get("x", 0.0))
         y_raw = float(data.get("y", 0.0))
-        # s = mode flag, available as data.get("s") if you want to use it
+        # s = mode flag, available as data.get("s") if you want it
 
         twist = Twist()
         twist.linear.x = x_raw * self.linear_scale
