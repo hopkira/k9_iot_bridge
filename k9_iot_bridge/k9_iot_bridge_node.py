@@ -8,12 +8,14 @@ import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
 
+
 def parse_joystick_payload(payload: str):
     """
-    Try JSON first; if that fails, parse EspruinoHub-style
-    object like {m:40,x:0,y:0,s:1}.
+    Try strict JSON first; if that fails, parse EspruinoHub-style
+    object like {m:40,x:0,y:0,s:1} (unquoted keys).
     """
     payload = payload.strip()
+
     # First try normal JSON
     try:
         return json.loads(payload)
@@ -54,12 +56,11 @@ def parse_joystick_payload(payload: str):
     return result
 
 
-
 class IotMqttBridge(Node):
     """
     Simple bridge:
       MQTT topic  : /ble/advertise/watch/espruino
-      MQTT payload: {"m":40,"x":0,"y":0,"s":1}
+      MQTT payload: {m:40,x:0,y:0,s:1} or {"m":40,"x":0,"y":0,"s":1}
       ROS topic   : /cmd_vel (geometry_msgs/Twist)
     """
 
@@ -167,8 +168,8 @@ class IotMqttBridge(Node):
             self.get_logger().warn("Joystick payload was empty or unparseable")
             return
 
-        x_raw = float(data.get("x", 0.0))
-        y_raw = float(data.get("y", 0.0))
+        x_raw = float(data.get("x", 0.0))  # forward/back
+        y_raw = float(data.get("y", 0.0))  # steer
 
         twist = Twist()
         twist.linear.x = x_raw * self.linear_scale
