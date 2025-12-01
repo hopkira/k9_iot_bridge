@@ -7,6 +7,7 @@ import paho.mqtt.client as mqtt
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
+from rclpy.qos import QoSProfile, QoSHistoryPolicy, QoSReliabilityPolicy
 
 
 def parse_joystick_payload(payload: str):
@@ -67,10 +68,12 @@ class IotMqttBridge(Node):
 
       ROS topic   : /cmd_vel (geometry_msgs/Twist)
 
-    Features:
-      - Fast/slow mode scaling
-      - Deadzone around center
-      - Exponential smoothing with instant hard stop on release
+    Behaviour (NO smoothing, NO deadzone):
+      - Raw joystick x/y are clamped to ±joystick_max_raw
+      - Mapped linearly to:
+          fast mode:  max_linear_fast (e.g. 1.4 m/s)
+          slow mode:  max_linear_slow (e.g. 0.35 m/s)
+          angular:    ±max_angular    (e.g. 0.628 rad/s)
     """
 
     def __init__(self):
@@ -98,21 +101,11 @@ class IotMqttBridge(Node):
         # Joystick raw range (from Bangle mapping, ~ ±98)
         self.declare_parameter("joystick_max_raw", 98.0)
 
-        # Deadzone in raw joystick units (to avoid drift)
-        # e.g. 5 means |x_raw|<5 treated as 0
-        self.declare_parameter("deadzone_raw", 7.0)
-
-        # Exponential smoothing factor (0..1)
-        # 0.2 = fairly responsive but smooth
-        self.declare_parameter("smoothing_alpha_accel", 0.3)
-        self.declare_parameter("smoothing_alpha_decel", 0.8)
-
         p = self.get_parameters([
             "mqtt_host", "mqtt_port", "mqtt_username", "mqtt_password",
             "mqtt_use_tls", "mqtt_ca_cert", "mqtt_joystick_topic",
             "max_linear_fast", "max_linear_slow", "max_angular",
-            "joystick_max_raw", "deadzone_raw", "smoothing_alpha_accel",
-            "smoothing_alpha_decel",
+            "joystick_max_raw",
         ])
 
         self.mqtt_host = p[0].value
@@ -126,20 +119,24 @@ class IotMqttBridge(Node):
         self.max_linear_slow = float(p[8].value)
         self.max_angular = float(p[9].value)
         self.joystick_max_raw = float(p[10].value)
-        self.deadzone_raw = float(p[11].value)
-        self.alpha_accel = float(p[12].value)
-        self.alpha_decel = float(p[13].value)
 
-        # ---------- ROS publisher ----------
-        self.cmd_vel_pub = self.create_publisher(Twist, "/cmd_vel", 10)
-        self.get_logger().info(
-            f"Publishing joystick data from MQTT topic "
-            f"'{self.joystick_topic}' to ROS topic '/cmd_vel'"
+        # ---------- ROS publisher with "latest wins" QoS ----------
+        # KEEP_LAST + depth=1 -> no backlog, only most recent cmd_vel kept
+        # BEST_EFFORT -> no retries, just always send the freshest command
+        cmd_vel_qos = QoSProfile(
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
         )
 
-        # ---------- State for smoothing ----------
-        self.last_linear = 0.0
-        self.last_angular = 0.0
+        self.cmd_vel_pub = self.create_publisher(
+            Twist, "/cmd_vel", cmd_vel_qos
+        )
+        self.get_logger().info(
+            f"Publishing joystick data from MQTT topic "
+            f"'{self.joystick_topic}' to ROS topic '/cmd_vel' "
+            f"with QoS KEEP_LAST(depth=1), BEST_EFFORT"
+        )
 
         # ---------- MQTT client ----------
         self.mqtt_client = mqtt.Client()
@@ -218,49 +215,22 @@ class IotMqttBridge(Node):
         if y_raw < -max_raw:
             y_raw = -max_raw
 
-        # ----- Deadzone and hard-stop behaviour -----
-        # If joystick near centre, treat as "finger off" → instant stop (no smoothing)
-        if abs(x_raw) <= self.deadzone_raw and abs(y_raw) <= self.deadzone_raw:
-            linear_out = 0.0
-            angular_out = 0.0
-            self.last_linear = 0.0
-            self.last_angular = 0.0
+        # ----- Mode-dependent scaling (NO deadzone, NO smoothing) -----
+        # Choose linear max speed based on mode
+        if mode_flag == 1:
+            max_linear = self.max_linear_fast   # e.g. 1.4 m/s
         else:
-            # ----- Mode-dependent scaling -----
-            # Choose linear max speed based on mode
-            if mode_flag == 1:
-                max_linear = self.max_linear_fast   # 1.4 m/s
-            else:
-                max_linear = self.max_linear_slow   # 0.35 m/s
+            max_linear = self.max_linear_slow   # e.g. 0.35 m/s
 
-            # Angular max is same for both modes
-            max_angular = self.max_angular         # 0.628 rad/s
+        max_angular = self.max_angular         # same for both modes
 
-            # Normalise raw joystick to [-1, 1]
-            norm_x = x_raw / max_raw
-            norm_y = y_raw / max_raw
+        # Normalise raw joystick to [-1, 1]
+        norm_x = x_raw / max_raw
+        norm_y = y_raw / max_raw
 
-            # Target velocities before smoothing
-            linear_target = norm_x * max_linear
-            angular_target = norm_y * max_angular
-
-            # ----- Exponential smoothing -----
-            prev_speed_mag = abs(self.last_linear) + abs(self.last_angular)
-            new_speed_mag  = abs(linear_target) + abs(angular_target)
-
-            if new_speed_mag < prev_speed_mag:
-                # Slowing down -> use stronger damping (quicker response)
-                a = self.alpha_decel
-            else:
-                # Speeding up or same -> smoother ramp
-                a = self.alpha_accel
-
-            linear_out = self.last_linear + a * (linear_target - self.last_linear)
-            angular_out = self.last_angular + a * (angular_target - self.last_angular)
-
-            self.last_linear = linear_out
-            self.last_angular = angular_out
-
+        # Direct mapping to velocities (no filtering)
+        linear_out = norm_x * max_linear
+        angular_out = norm_y * max_angular
 
         twist = Twist()
         twist.linear.x = linear_out
@@ -282,7 +252,7 @@ def main(args=None):
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
-        pass
+            pass
     finally:
         node.destroy_node()
         rclpy.shutdown()
