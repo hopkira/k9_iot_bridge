@@ -126,7 +126,7 @@ class IotMqttBridge(Node):
         cmd_vel_qos = QoSProfile(
             history=QoSHistoryPolicy.KEEP_LAST,
             depth=1,
-            reliability=QoSReliabilityPolicy.BEST_EFFORT,
+            reliability=QoSReliabilityPolicy.RELIABLE,
         )
 
         self.cmd_vel_pub = self.create_publisher(
