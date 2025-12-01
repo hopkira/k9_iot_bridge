@@ -104,13 +104,15 @@ class IotMqttBridge(Node):
 
         # Exponential smoothing factor (0..1)
         # 0.2 = fairly responsive but smooth
-        self.declare_parameter("smoothing_alpha", 0.25)
+        self.declare_parameter("smoothing_alpha_accel", 0.3)
+        self.declare_parameter("smoothing_alpha_decel", 0.8)
 
         p = self.get_parameters([
             "mqtt_host", "mqtt_port", "mqtt_username", "mqtt_password",
             "mqtt_use_tls", "mqtt_ca_cert", "mqtt_joystick_topic",
             "max_linear_fast", "max_linear_slow", "max_angular",
-            "joystick_max_raw", "deadzone_raw", "smoothing_alpha",
+            "joystick_max_raw", "deadzone_raw", "smoothing_alpha_accel",
+            "smoothing_alpha_decel",
         ])
 
         self.mqtt_host = p[0].value
@@ -125,7 +127,8 @@ class IotMqttBridge(Node):
         self.max_angular = float(p[9].value)
         self.joystick_max_raw = float(p[10].value)
         self.deadzone_raw = float(p[11].value)
-        self.alpha = float(p[12].value)
+        self.alpha_accel = float(p[12].value)
+        self.alpha_decel = float(p[13].value)
 
         # ---------- ROS publisher ----------
         self.cmd_vel_pub = self.create_publisher(Twist, "/cmd_vel", 10)
@@ -242,12 +245,22 @@ class IotMqttBridge(Node):
             angular_target = norm_y * max_angular
 
             # ----- Exponential smoothing -----
-            a = self.alpha
+            prev_speed_mag = abs(self.last_linear) + abs(self.last_angular)
+            new_speed_mag  = abs(linear_target) + abs(angular_target)
+
+            if new_speed_mag < prev_speed_mag:
+                # Slowing down -> use stronger damping (quicker response)
+                a = self.alpha_decel
+            else:
+                # Speeding up or same -> smoother ramp
+                a = self.alpha_accel
+
             linear_out = self.last_linear + a * (linear_target - self.last_linear)
             angular_out = self.last_angular + a * (angular_target - self.last_angular)
 
             self.last_linear = linear_out
             self.last_angular = angular_out
+
 
         twist = Twist()
         twist.linear.x = linear_out
