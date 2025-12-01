@@ -58,10 +58,19 @@ def parse_joystick_payload(payload: str):
 
 class IotMqttBridge(Node):
     """
-    Simple bridge:
+    Bridge:
       MQTT topic  : /ble/advertise/watch/espruino
       MQTT payload: {m:40,x:0,y:0,s:1} or {"m":40,"x":0,"y":0,"s":1}
+        x = forward/back joystick value  (~ -98..+98)
+        y = steer joystick value         (~ -98..+98)
+        s = speed mode (0=slow, 1=fast)
+
       ROS topic   : /cmd_vel (geometry_msgs/Twist)
+
+    Features:
+      - Fast/slow mode scaling
+      - Deadzone around center
+      - Exponential smoothing with instant hard stop on release
     """
 
     def __init__(self):
@@ -80,14 +89,28 @@ class IotMqttBridge(Node):
             "mqtt_joystick_topic", "/ble/advertise/watch/espruino"
         )
 
-        # Scale factors to map joystick units to velocities
-        self.declare_parameter("linear_scale", 0.01)   # m/s per x unit
-        self.declare_parameter("angular_scale", 0.01)  # rad/s per y unit
+        # Max speeds
+        # Fast mode: 1.4 m/s, Slow mode: 0.35 m/s, Angular: ±0.628 rad/s
+        self.declare_parameter("max_linear_fast", 1.4)
+        self.declare_parameter("max_linear_slow", 0.35)
+        self.declare_parameter("max_angular", 0.628)
+
+        # Joystick raw range (from Bangle mapping, ~ ±98)
+        self.declare_parameter("joystick_max_raw", 98.0)
+
+        # Deadzone in raw joystick units (to avoid drift)
+        # e.g. 5 means |x_raw|<5 treated as 0
+        self.declare_parameter("deadzone_raw", 7.0)
+
+        # Exponential smoothing factor (0..1)
+        # 0.2 = fairly responsive but smooth
+        self.declare_parameter("smoothing_alpha", 0.25)
 
         p = self.get_parameters([
             "mqtt_host", "mqtt_port", "mqtt_username", "mqtt_password",
             "mqtt_use_tls", "mqtt_ca_cert", "mqtt_joystick_topic",
-            "linear_scale", "angular_scale",
+            "max_linear_fast", "max_linear_slow", "max_angular",
+            "joystick_max_raw", "deadzone_raw", "smoothing_alpha",
         ])
 
         self.mqtt_host = p[0].value
@@ -97,8 +120,12 @@ class IotMqttBridge(Node):
         self.mqtt_use_tls = bool(p[4].value)
         self.mqtt_ca_cert = p[5].value
         self.joystick_topic = p[6].value
-        self.linear_scale = float(p[7].value)
-        self.angular_scale = float(p[8].value)
+        self.max_linear_fast = float(p[7].value)
+        self.max_linear_slow = float(p[8].value)
+        self.max_angular = float(p[9].value)
+        self.joystick_max_raw = float(p[10].value)
+        self.deadzone_raw = float(p[11].value)
+        self.alpha = float(p[12].value)
 
         # ---------- ROS publisher ----------
         self.cmd_vel_pub = self.create_publisher(Twist, "/cmd_vel", 10)
@@ -106,6 +133,10 @@ class IotMqttBridge(Node):
             f"Publishing joystick data from MQTT topic "
             f"'{self.joystick_topic}' to ROS topic '/cmd_vel'"
         )
+
+        # ---------- State for smoothing ----------
+        self.last_linear = 0.0
+        self.last_angular = 0.0
 
         # ---------- MQTT client ----------
         self.mqtt_client = mqtt.Client()
@@ -168,17 +199,66 @@ class IotMqttBridge(Node):
             self.get_logger().warn("Joystick payload was empty or unparseable")
             return
 
+        # Raw joystick values (Espruino code sends these)
         x_raw = float(data.get("x", 0.0))  # forward/back
         y_raw = float(data.get("y", 0.0))  # steer
+        mode_flag = int(data.get("s", 0))  # 0=slow, 1=fast
+
+        # Clamp raw values to expected range
+        max_raw = self.joystick_max_raw
+        if x_raw > max_raw:
+            x_raw = max_raw
+        if x_raw < -max_raw:
+            x_raw = -max_raw
+        if y_raw > max_raw:
+            y_raw = max_raw
+        if y_raw < -max_raw:
+            y_raw = -max_raw
+
+        # ----- Deadzone and hard-stop behaviour -----
+        # If joystick near centre, treat as "finger off" → instant stop (no smoothing)
+        if abs(x_raw) <= self.deadzone_raw and abs(y_raw) <= self.deadzone_raw:
+            linear_out = 0.0
+            angular_out = 0.0
+            self.last_linear = 0.0
+            self.last_angular = 0.0
+        else:
+            # ----- Mode-dependent scaling -----
+            # Choose linear max speed based on mode
+            if mode_flag == 1:
+                max_linear = self.max_linear_fast   # 1.4 m/s
+            else:
+                max_linear = self.max_linear_slow   # 0.35 m/s
+
+            # Angular max is same for both modes
+            max_angular = self.max_angular         # 0.628 rad/s
+
+            # Normalise raw joystick to [-1, 1]
+            norm_x = x_raw / max_raw
+            norm_y = y_raw / max_raw
+
+            # Target velocities before smoothing
+            linear_target = norm_x * max_linear
+            angular_target = norm_y * max_angular
+
+            # ----- Exponential smoothing -----
+            a = self.alpha
+            linear_out = self.last_linear + a * (linear_target - self.last_linear)
+            angular_out = self.last_angular + a * (angular_target - self.last_angular)
+
+            self.last_linear = linear_out
+            self.last_angular = angular_out
 
         twist = Twist()
-        twist.linear.x = x_raw * self.linear_scale
-        twist.angular.z = y_raw * self.angular_scale
+        twist.linear.x = linear_out
+        twist.angular.z = angular_out
 
         self.cmd_vel_pub.publish(twist)
 
         self.get_logger().debug(
-            f"cmd_vel: linear.x={twist.linear.x:.3f}, "
+            f"cmd_vel: mode={'FAST' if mode_flag==1 else 'SLOW'}, "
+            f"raw=({x_raw:.1f},{y_raw:.1f}), "
+            f"linear.x={twist.linear.x:.3f}, "
             f"angular.z={twist.angular.z:.3f}"
         )
 
