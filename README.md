@@ -2,6 +2,7 @@
 # 🕹️ Bangle2 → ROS2 Joystick Bridge
 
 This ROS2 node lets you control a robot using a **Bangle.js 2 smartwatch** as a wireless BLE joystick. The joystick has two modes: fast and slow.  In the slow mode, movement is confined to forward, backwards and spin.  In the fast mode a combination of linear and angular movement is possible - and at higher speeds.
+The full setup instructions are provided in [my blog](https://k9-build.blogspot.com/2025/11/using-banglejs-2-smartwatch-as-ble-ros2.html).
 The node listens for BLE advertising packets (broadcast by the watch) via **EspruinoHub**, parses joystick values, and publishes a standard ROS `cmd_vel` message.
 
 Ideal for remote teleop, walking robots, robot dogs, rovers, etc.  
