@@ -179,29 +179,29 @@ class IotMqttBridge(Node):
                         return
                     time.sleep(0.1)
 
-def _on_mqtt_connect(self, client, userdata, flags, rc):
-    if rc == 0:
-        self.get_logger().info("Connected to MQTT broker.")
+    def on_mqtt_connect(self, client, userdata, flags, rc):
+        if rc == 0:
+            self.get_logger().info("Connected to MQTT broker.")
 
-        # Subscribe to joystick UART data
-        client.subscribe(self.joystick_topic)
-        self.get_logger().info(
-            f"Subscribed to joystick topic: {self.joystick_topic}"
-        )
-
-        # *** Enable UART notifications on EspruinoHub ***
-        # This tells EspruinoHub to start NUS RX notify for 'watch'
-        notify_topic = "/ble/notify/watch/nus/nus_rx"
-        try:
-            client.publish(notify_topic, "true", qos=0, retain=False)
-            self.get_logger().info(f"Requested UART notify on {notify_topic}")
-        except Exception as e:
-            self.get_logger().error(
-                f"Failed to publish UART notify request: {e}"
+            # Subscribe to joystick UART data
+            client.subscribe(self.joystick_topic)
+            self.get_logger().info(
+                f"Subscribed to joystick topic: {self.joystick_topic}"
             )
 
-    else:
-        self.get_logger().error(f"Failed to connect to MQTT, rc={rc}")
+            # *** Enable UART notifications on EspruinoHub ***
+            # This tells EspruinoHub to start NUS RX notify for 'watch'
+            notify_topic = "/ble/notify/watch/nus/nus_rx"
+            try:
+                client.publish(notify_topic, "true", qos=0, retain=False)
+                self.get_logger().info(f"Requested UART notify on {notify_topic}")
+            except Exception as e:
+                self.get_logger().error(
+                    f"Failed to publish UART notify request: {e}"
+                )
+
+        else:
+            self.get_logger().error(f"Failed to connect to MQTT, rc={rc}")
 
     def _on_mqtt_message(self, client, userdata, msg):
         payload = msg.payload.decode("utf-8", errors="ignore")
