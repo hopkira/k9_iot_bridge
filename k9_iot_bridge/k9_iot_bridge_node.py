@@ -179,7 +179,7 @@ class IotMqttBridge(Node):
                         return
                     time.sleep(0.1)
 
-    def on_mqtt_connect(self, client, userdata, flags, rc):
+    def _on_mqtt_connect(self, client, userdata, flags, rc):
         if rc == 0:
             self.get_logger().info("Connected to MQTT broker.")
 
