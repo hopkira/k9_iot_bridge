@@ -193,7 +193,7 @@ class IotMqttBridge(Node):
             # This tells EspruinoHub to start NUS RX notify for 'watch'
             notify_topic = "/ble/notify/watch/nus/nus_rx"
             try:
-                client.publish(notify_topic, "true", qos=0, retain=False)
+                client.publish(notify_topic, "true", qos=0, retain=True)
                 self.get_logger().info(f"Requested UART notify on {notify_topic}")
             except Exception as e:
                 self.get_logger().error(
