@@ -60,7 +60,7 @@ def parse_joystick_payload(payload: str):
 class IotMqttBridge(Node):
     """
     Bridge:
-      MQTT topic  : /ble/advertise/watch/espruino
+      MQTT topic  : /ble/data/watch/nus/nus_rx
       MQTT payload: {m:40,x:0,y:0,s:1} or {"m":40,"x":0,"y":0,"s":1}
         x = forward/back joystick value  (~ -98..+98)
         y = steer joystick value         (~ -98..+98)
@@ -89,7 +89,7 @@ class IotMqttBridge(Node):
 
         # EspruinoHub joystick topic
         self.declare_parameter(
-            "mqtt_joystick_topic", "/ble/advertise/watch/espruino"
+            "mqtt_joystick_topic", "/ble/data/watch/nus/nus_rx"
         )
 
         # Max speeds
@@ -135,7 +135,7 @@ class IotMqttBridge(Node):
         self.get_logger().info(
             f"Publishing joystick data from MQTT topic "
             f"'{self.joystick_topic}' to ROS topic '/cmd_vel' "
-            f"with QoS KEEP_LAST(depth=1), BEST_EFFORT"
+            f"with QoS KEEP_LAST(depth=1), RELIABLE"
         )
 
         # ---------- MQTT client ----------
