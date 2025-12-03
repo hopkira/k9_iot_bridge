@@ -95,7 +95,7 @@ class BangleBleJoystickBridge(Node):
         self.declare_parameter("joystick_max_raw", 98.0)
 
         # Reconnect delay (seconds) after a BLE error / disconnect
-        self.declare_parameter("reconnect_delay", 2.0)
+        self.declare_parameter("reconnect_delay", 1.0)
 
         params = self.get_parameters([
             "ble_address",
@@ -179,7 +179,7 @@ class BangleBleJoystickBridge(Node):
         Main BLE task: connect, subscribe, handle notifications, reconnect on error.
         Includes a watchdog: if no messages for IDLE_TIMEOUT seconds, force reconnect.
         """
-        IDLE_TIMEOUT = 10.0  # seconds with no joystick messages before we assume it's dead
+        IDLE_TIMEOUT = 2.0  # seconds with no joystick messages before we assume it's dead
 
         while rclpy.ok():
             client = BleakClient(self.ble_address)
