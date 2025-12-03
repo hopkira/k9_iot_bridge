@@ -130,6 +130,9 @@ class BleBridge(Node):
         self.joystick_max_raw = float(p[6].value)
         self.reconnect_delay = float(p[7].value)
 
+        # Buffer for assembling complete JSON lines from BLE
+        self._rx_buffer = ""
+
         # ---------- ROS publisher with "latest wins" QoS ----------
         cmd_vel_qos = QoSProfile(
             history=QoSHistoryPolicy.KEEP_LAST,
@@ -207,19 +210,33 @@ class BleBridge(Node):
     def _notification_handler(self, handle: int, data: bytearray):
         """
         Called by bleak when a BLE notification is received.
-        `data` is a bytearray with whatever the Bangle sent (JSON line).
+        We may get partial lines or multiple lines per notification,
+        so we buffer and split on '\n'.
         """
         try:
-            payload = data.decode("utf-8", errors="ignore").strip()
+            chunk = data.decode("utf-8", errors="ignore")
         except Exception as e:
             self.get_logger().error(f"Failed to decode BLE payload: {e}")
             return
 
-        if not payload:
+        if not chunk:
             return
 
-        # self.get_logger().debug(f"BLE payload: {payload}")
-        self._handle_joystick_payload(payload)
+        # Append to our buffer
+        self._rx_buffer += chunk
+
+        # Process all complete lines
+        while "\n" in self._rx_buffer:
+            line, self._rx_buffer = self._rx_buffer.split("\n", 1)
+            line = line.strip()
+            if not line:
+                continue
+
+            # Uncomment for debugging:
+            # self.get_logger().info(f"BLE line: {line}")
+
+            self._handle_joystick_payload(line)
+
 
     # ---------- Joystick payload handling (mostly copied from MQTT version) ----------
 
