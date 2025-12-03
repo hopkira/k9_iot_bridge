@@ -257,19 +257,18 @@ class BangleBleJoystickBridge(Node):
         self.get_logger().info("[BLE] BLE loop exiting")
 
     # ---------- BLE notification callback ----------
-
     def _notification_handler(self, handle: int, data: bytearray):
         """
         Called by bleak when a BLE notification is received.
-        We may get partial lines or multiple lines per notification,
-        so we buffer and split on '\n'.
+        We may get partial lines or multiple lines per notification.
+
+        To minimise lag, we implement 'latest-wins' semantics:
+        if multiple complete lines arrive at once, we only process the last one.
         """
         try:
             chunk = data.decode("utf-8", errors="ignore")
         except Exception as e:
-            self.get_logger().error(
-                f"Failed to decode BLE payload: {e}"
-            )
+            self.get_logger().error(f"Failed to decode BLE payload: {e}")
             return
 
         if not chunk:
@@ -277,19 +276,32 @@ class BangleBleJoystickBridge(Node):
 
         self._rx_buffer += chunk
 
-        while "\n" in self._rx_buffer:
-            line, self._rx_buffer = self._rx_buffer.split("\n", 1)
-            line = line.strip()
-            if not line:
-                continue
+        # If there's no newline at all yet, we can't form a complete line.
+        if "\n" not in self._rx_buffer:
+            return
 
-            # We saw *some* line over BLE – update watchdog
-            self._last_msg_time = time.time()
+        # Split into lines; last element may be incomplete, so keep it in buffer.
+        parts = self._rx_buffer.split("\n")
+        # Everything except the last element are complete lines
+        complete_lines = parts[:-1]
+        # Remainder (possibly empty or partial line) stays in buffer
+        self._rx_buffer = parts[-1]
 
-            # Optional debug:
-            # self.get_logger().info(f"BLE line: {repr(line)}")
+        if not complete_lines:
+            return
 
-            self._handle_joystick_payload(line)
+        # Take only the most recent complete line to avoid replaying stale commands
+        latest_line = complete_lines[-1].strip()
+        if not latest_line:
+            return
+
+        # We saw *some* line over BLE – update watchdog
+        self._last_msg_time = time.time()
+
+        # Optional debug:
+        # self.get_logger().info(f"BLE latest line: {repr(latest_line)}")
+
+        self._handle_joystick_payload(latest_line)
 
     # ---------- Joystick payload handling ----------
 
