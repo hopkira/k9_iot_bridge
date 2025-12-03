@@ -210,6 +210,7 @@ class BleBridge(Node):
     def _notification_handler(self, handle: int, data: bytearray):
         """
         Called by bleak when a BLE notification is received.
+
         We may get partial lines or multiple lines per notification,
         so we buffer and split on '\n'.
         """
@@ -232,19 +233,26 @@ class BleBridge(Node):
             if not line:
                 continue
 
-            # Uncomment for debugging:
-            # self.get_logger().info(f"BLE line: {line}")
+            # DEBUG: log exactly what we got from BLE
+            self.get_logger().info(f"BLE line: {repr(line)}")
 
             self._handle_joystick_payload(line)
-
 
     # ---------- Joystick payload handling (mostly copied from MQTT version) ----------
 
     def _handle_joystick_payload(self, payload: str):
+        # Quick filter: only bother with things that look vaguely like joystick JSON
+        if "x" not in payload or "y" not in payload:
+            # Probably some other console text, ignore silently
+            return
+
         # Accept either proper JSON or Espruino-style {m:40,x:0,y:0,s:1}
         data = parse_joystick_payload(payload)
         if not data:
-            self.get_logger().warn("Joystick payload was empty or unparseable")
+            # Now include the raw payload so we can see what's wrong
+            self.get_logger().warn(
+                f"Joystick payload was empty or unparseable: {repr(payload)}"
+            )
             return
 
         # Raw joystick values (Bangle code sends these)
