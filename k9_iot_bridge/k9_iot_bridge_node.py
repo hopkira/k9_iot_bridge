@@ -2,6 +2,7 @@
 import asyncio
 import json
 import threading
+import time
 from typing import Dict, Any
 
 import rclpy
@@ -16,8 +17,6 @@ def parse_joystick_payload(payload: str) -> Dict[str, Any]:
     """
     Try strict JSON first; if that fails, parse EspruinoHub-style
     object like {m:40,x:0,y:0,s:1} (unquoted keys).
-
-    Kept from original implementation for maximum compatibility.
     """
     payload = payload.strip()
 
@@ -61,7 +60,7 @@ def parse_joystick_payload(payload: str) -> Dict[str, Any]:
     return result
 
 
-class BleBridge(Node):
+class BangleBleJoystickBridge(Node):
     """
     Bridge:
       BLE device : Bangle.js 2 (or Puck.js) exposing a notify characteristic
@@ -79,24 +78,19 @@ class BleBridge(Node):
     BLE:
       - Uses bleak in a background asyncio loop
       - Reconnects automatically if the connection drops
+      - Watchdog: if no messages for IDLE_TIMEOUT seconds, force reconnect
     """
 
     def __init__(self):
         super().__init__("bangle_ble_joystick_bridge")
 
         # ---------- Parameters ----------
-        # Bangle BLE address (use your Bangle's MAC here or override via params)
         self.declare_parameter("ble_address", "E5:5D:2D:CE:6E:E7")
-
-        # Service / characteristic UUIDs for joystick data.
-        # Defaults to Nordic UART Service TX characteristic.
         self.declare_parameter(
-            "ble_service_uuid",
-            "6e400001-b5a3-f393-e0a9-e50e24dcca9e",
+            "ble_service_uuid", "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
         )
         self.declare_parameter(
-            "ble_char_uuid",
-            "6e400003-b5a3-f393-e0a9-e50e24dcca9e",  # NUS TX (notify)
+            "ble_char_uuid", "6e400003-b5a3-f393-e0a9-e50e24dcca9e"  # NUS TX (notify)
         )
 
         # Max speeds
@@ -107,10 +101,10 @@ class BleBridge(Node):
         # Joystick raw range (from Bangle mapping, ~ ±98)
         self.declare_parameter("joystick_max_raw", 98.0)
 
-        # Reconnect delay (seconds) after a BLE error
+        # Reconnect delay (seconds) after a BLE error / disconnect
         self.declare_parameter("reconnect_delay", 2.0)
 
-        p = self.get_parameters([
+        params = self.get_parameters([
             "ble_address",
             "ble_service_uuid",
             "ble_char_uuid",
@@ -121,17 +115,14 @@ class BleBridge(Node):
             "reconnect_delay",
         ])
 
-        self.ble_address = p[0].value
-        self.ble_service_uuid = p[1].value
-        self.ble_char_uuid = p[2].value
-        self.max_linear_fast = float(p[3].value)
-        self.max_linear_slow = float(p[4].value)
-        self.max_angular = float(p[5].value)
-        self.joystick_max_raw = float(p[6].value)
-        self.reconnect_delay = float(p[7].value)
-
-        # Buffer for assembling complete JSON lines from BLE
-        self._rx_buffer = ""
+        self.ble_address = params[0].value
+        self.ble_service_uuid = params[1].value
+        self.ble_char_uuid = params[2].value
+        self.max_linear_fast = float(params[3].value)
+        self.max_linear_slow = float(params[4].value)
+        self.max_angular = float(params[5].value)
+        self.joystick_max_raw = float(params[6].value)
+        self.reconnect_delay = float(params[7].value)
 
         # ---------- ROS publisher with "latest wins" QoS ----------
         cmd_vel_qos = QoSProfile(
@@ -148,6 +139,11 @@ class BleBridge(Node):
             "with QoS KEEP_LAST(depth=1), RELIABLE"
         )
 
+        # Buffer for assembling complete JSON lines from BLE
+        self._rx_buffer = ""
+        # Time of last valid BLE line seen (for watchdog)
+        self._last_msg_time = 0.0
+
         # ---------- BLE client in background thread ----------
         self._ble_thread = threading.Thread(
             target=self._ble_thread_fn,
@@ -158,98 +154,147 @@ class BleBridge(Node):
     # ---------- BLE thread & asyncio loop ----------
 
     def _ble_thread_fn(self):
-        """
-        Run the asyncio event loop for bleak in a background thread.
-        """
         asyncio.run(self._ble_main())
 
     async def _ble_main(self):
         """
         Main BLE task: connect, subscribe, handle notifications, reconnect on error.
+        Includes a watchdog: if no messages for IDLE_TIMEOUT seconds, force reconnect.
         """
+        IDLE_TIMEOUT = 10.0  # seconds with no joystick messages before we assume it's dead
+
         while rclpy.ok():
+            client = BleakClient(self.ble_address)
+
             try:
                 self.get_logger().info(
-                    f"Connecting to Bangle at {self.ble_address}..."
+                    f"[BLE] Trying to connect to {self.ble_address}..."
                 )
-                async with BleakClient(self.ble_address) as client:
-                    self.get_logger().info("Connected to Bangle")
+                await client.connect()
+                if not client.is_connected:
+                    raise RuntimeError(
+                        "connect() returned but client.is_connected is False"
+                    )
 
-                    # Optionally, you could check services here, but usually not needed
-                    # await client.get_services()
+                self.get_logger().info("[BLE] Connected to Bangle")
 
+                # Reset watchdog when we connect
+                self._last_msg_time = time.time()
+
+                self.get_logger().info(
+                    f"[BLE] start_notify on {self.ble_char_uuid}"
+                )
+                await client.start_notify(
+                    self.ble_char_uuid,
+                    self._notification_handler,
+                )
+
+                # Wait here until ROS is shutting down or connection is considered dead
+                while rclpy.ok():
+                    if not client.is_connected:
+                        self.get_logger().warning(
+                            "[BLE] client.is_connected == False"
+                        )
+                        break
+
+                    now = time.time()
+                    if (
+                        self._last_msg_time > 0
+                        and (now - self._last_msg_time) > IDLE_TIMEOUT
+                    ):
+                        self.get_logger().warning(
+                            f"[BLE] No joystick messages for {now - self._last_msg_time:.1f}s "
+                            f"(>{IDLE_TIMEOUT}s), forcing reconnect"
+                        )
+                        await client.disconnect()
+                        break
+
+                    await asyncio.sleep(0.5)
+
+                if not rclpy.ok():
                     self.get_logger().info(
-                        f"Subscribing to notify characteristic {self.ble_char_uuid}"
+                        "[BLE] ROS shutting down, leaving loop"
                     )
-                    await client.start_notify(
-                        self.ble_char_uuid,
-                        self._notification_handler,
-                    )
-
-                    # Keep the connection alive until ROS shuts down or BLE disconnects
-                    while rclpy.ok() and client.is_connected:
-                        await asyncio.sleep(0.1)
-
-                    self.get_logger().warning(
-                        "Bangle disconnected, will attempt to reconnect..."
+                else:
+                    self.get_logger().info(
+                        "[BLE] Connection ended, will attempt reconnect"
                     )
 
             except Exception as e:
-                self.get_logger().error(f"BLE error: {e}")
+                self.get_logger().error(
+                    f"[BLE] Exception in _ble_main: {e}"
+                )
 
-            # Backoff before reconnect attempt
+            finally:
+                if client.is_connected:
+                    try:
+                        self.get_logger().info(
+                            "[BLE] Disconnecting client cleanly..."
+                        )
+                        await client.disconnect()
+                    except Exception as e:
+                        self.get_logger().error(
+                            f"[BLE] Error during disconnect: {e}"
+                        )
+
             if not rclpy.ok():
                 break
 
+            self.get_logger().info(
+                f"[BLE] Sleeping {self.reconnect_delay} seconds before retry"
+            )
             await asyncio.sleep(self.reconnect_delay)
 
-        self.get_logger().info("BLE loop exiting (ROS is shutting down).")
+        self.get_logger().info("[BLE] BLE loop exiting")
 
     # ---------- BLE notification callback ----------
 
     def _notification_handler(self, handle: int, data: bytearray):
         """
         Called by bleak when a BLE notification is received.
-
         We may get partial lines or multiple lines per notification,
         so we buffer and split on '\n'.
         """
         try:
             chunk = data.decode("utf-8", errors="ignore")
         except Exception as e:
-            self.get_logger().error(f"Failed to decode BLE payload: {e}")
+            self.get_logger().error(
+                f"Failed to decode BLE payload: {e}"
+            )
             return
 
         if not chunk:
             return
 
-        # Append to our buffer
         self._rx_buffer += chunk
 
-        # Process all complete lines
         while "\n" in self._rx_buffer:
             line, self._rx_buffer = self._rx_buffer.split("\n", 1)
             line = line.strip()
             if not line:
                 continue
 
-            # DEBUG: log exactly what we got from BLE
+            # We saw *some* line over BLE – update watchdog
+            self._last_msg_time = time.time()
+
+            # Optional debug:
             # self.get_logger().info(f"BLE line: {repr(line)}")
 
             self._handle_joystick_payload(line)
 
-    # ---------- Joystick payload handling (mostly copied from MQTT version) ----------
+    # ---------- Joystick payload handling ----------
 
     def _handle_joystick_payload(self, payload: str):
         # Quick filter: only bother with things that look vaguely like joystick JSON
         if "x" not in payload or "y" not in payload:
-            # Probably some other console text, ignore silently
             return
 
-        # Accept either proper JSON or Espruino-style {m:40,x:0,y:0,s:1}
+        # Strip common REPL junk (e.g. leading '>')
+        if payload.startswith(">"):
+            payload = payload.lstrip(">").strip()
+
         data = parse_joystick_payload(payload)
         if not data:
-            # Now include the raw payload so we can see what's wrong
             self.get_logger().warn(
                 f"Joystick payload was empty or unparseable: {repr(payload)}"
             )
@@ -262,14 +307,8 @@ class BleBridge(Node):
 
         # Clamp raw values to expected range
         max_raw = self.joystick_max_raw
-        if x_raw > max_raw:
-            x_raw = max_raw
-        if x_raw < -max_raw:
-            x_raw = -max_raw
-        if y_raw > max_raw:
-            y_raw = max_raw
-        if y_raw < -max_raw:
-            y_raw = -max_raw
+        x_raw = max(-max_raw, min(max_raw, x_raw))
+        y_raw = max(-max_raw, min(max_raw, y_raw))
 
         # Mode-dependent scaling (NO deadzone, NO smoothing)
         if mode_flag == 1:
@@ -293,7 +332,7 @@ class BleBridge(Node):
 
         self.cmd_vel_pub.publish(twist)
 
-        # Debug logging (optional)
+        # Optional debug:
         # self.get_logger().debug(
         #     f"cmd_vel: mode={'FAST' if mode_flag==1 else 'SLOW'}, "
         #     f"raw=({x_raw:.1f},{y_raw:.1f}), "
@@ -301,9 +340,10 @@ class BleBridge(Node):
         #     f"angular.z={twist.angular.z:.3f}"
         # )
 
+
 def main(args=None):
     rclpy.init(args=args)
-    node = BleBridge()
+    node = BangleBleJoystickBridge()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
