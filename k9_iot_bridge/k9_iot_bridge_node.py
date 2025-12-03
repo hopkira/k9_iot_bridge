@@ -234,7 +234,7 @@ class BleBridge(Node):
                 continue
 
             # DEBUG: log exactly what we got from BLE
-            self.get_logger().info(f"BLE line: {repr(line)}")
+            # self.get_logger().info(f"BLE line: {repr(line)}")
 
             self._handle_joystick_payload(line)
 
@@ -300,7 +300,6 @@ class BleBridge(Node):
         #     f"linear.x={twist.linear.x:.3f}, "
         #     f"angular.z={twist.angular.z:.3f}"
         # )
-
 
 def main(args=None):
     rclpy.init(args=args)
