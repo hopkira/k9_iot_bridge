@@ -63,17 +63,10 @@ def parse_joystick_payload(payload: str) -> Dict[str, Any]:
 class BangleBleJoystickBridge(Node):
     """
     Bridge:
-      BLE device : Bangle.js 2 (or Puck.js) exposing a notify characteristic
+      BLE device : Bangle.js 2 exposing a notify characteristic
                    sending JSON lines like:
                      {"m":40,"x":0,"y":0,"s":1}
       ROS topic  : /cmd_vel (geometry_msgs/Twist)
-
-    Behaviour (NO smoothing, NO deadzone):
-      - Raw joystick x/y are clamped to ±joystick_max_raw
-      - Mapped linearly to:
-          fast mode:  max_linear_fast (e.g. 1.4 m/s)
-          slow mode:  max_linear_slow (e.g. 0.35 m/s)
-          angular:    ±max_angular    (e.g. 0.628 rad/s)
 
     BLE:
       - Uses bleak in a background asyncio loop
@@ -156,12 +149,37 @@ class BangleBleJoystickBridge(Node):
     def _ble_thread_fn(self):
         asyncio.run(self._ble_main())
 
+    async def _safe_disconnect(self, client: BleakClient):
+        """
+        Try to disconnect, swallowing the common BlueZ 'UnknownObject' error
+        that happens when the device DBus object is already gone.
+        """
+        try:
+            if client.is_connected:
+                self.get_logger().info("[BLE] Disconnecting client cleanly...")
+                await client.disconnect()
+            else:
+                # Even if not connected, disconnect() may still touch DBus
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+        except Exception as e:
+            if "UnknownObject" in str(e):
+                self.get_logger().warn(
+                    "[BLE] Device already gone (DBus UnknownObject). Continuing..."
+                )
+            else:
+                self.get_logger().error(
+                    f"[BLE] Error during disconnect: {e}"
+                )
+
     async def _ble_main(self):
         """
         Main BLE task: connect, subscribe, handle notifications, reconnect on error.
         Includes a watchdog: if no messages for IDLE_TIMEOUT seconds, force reconnect.
         """
-        IDLE_TIMEOUT = 2.0  # seconds with no joystick messages before we assume it's dead
+        IDLE_TIMEOUT = 10.0  # seconds with no joystick messages before we assume it's dead
 
         while rclpy.ok():
             client = BleakClient(self.ble_address)
@@ -206,7 +224,7 @@ class BangleBleJoystickBridge(Node):
                             f"[BLE] No joystick messages for {now - self._last_msg_time:.1f}s "
                             f"(>{IDLE_TIMEOUT}s), forcing reconnect"
                         )
-                        await client.disconnect()
+                        await self._safe_disconnect(client)
                         break
 
                     await asyncio.sleep(0.5)
@@ -226,23 +244,7 @@ class BangleBleJoystickBridge(Node):
                 )
 
             finally:
-                # Always try to disconnect, but BlueZ often already removed the device.
-                try:
-                    if client.is_connected:
-                        self.get_logger().info("[BLE] Disconnecting client cleanly...")
-                        await client.disconnect()
-                    else:
-                        # Even if not connected, calling disconnect() is safe, but may raise DBus errors.
-                        try:
-                            await client.disconnect()
-                        except Exception:
-                            pass
-                except Exception as e:
-                    if "UnknownObject" in str(e):
-                        # This is fine — it just means BlueZ already removed the device entry.
-                        self.get_logger().warn("[BLE] Device already gone (DBus UnknownObject). Continuing...")
-                    else:
-                        self.get_logger().error(f"[BLE] Error during disconnect: {e}")
+                await self._safe_disconnect(client)
 
             if not rclpy.ok():
                 break
@@ -321,7 +323,7 @@ class BangleBleJoystickBridge(Node):
         if mode_flag == 1:
             max_linear = self.max_linear_fast   # e.g. 1.4 m/s
         else:
-            max_linear = self.max_linear_slow   # e.g. 0.35 m/s
+            max_linear = self.max_linear_slow   # e.g. 0.35 m/s)
 
         max_angular = self.max_angular         # same for both modes
 
