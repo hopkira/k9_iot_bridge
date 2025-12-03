@@ -161,7 +161,7 @@ class BangleBleJoystickBridge(Node):
         Main BLE task: connect, subscribe, handle notifications, reconnect on error.
         Includes a watchdog: if no messages for IDLE_TIMEOUT seconds, force reconnect.
         """
-        IDLE_TIMEOUT = 10.0  # seconds with no joystick messages before we assume it's dead
+        IDLE_TIMEOUT = 2.0  # seconds with no joystick messages before we assume it's dead
 
         while rclpy.ok():
             client = BleakClient(self.ble_address)
@@ -226,16 +226,23 @@ class BangleBleJoystickBridge(Node):
                 )
 
             finally:
-                if client.is_connected:
-                    try:
-                        self.get_logger().info(
-                            "[BLE] Disconnecting client cleanly..."
-                        )
+                # Always try to disconnect, but BlueZ often already removed the device.
+                try:
+                    if client.is_connected:
+                        self.get_logger().info("[BLE] Disconnecting client cleanly...")
                         await client.disconnect()
-                    except Exception as e:
-                        self.get_logger().error(
-                            f"[BLE] Error during disconnect: {e}"
-                        )
+                    else:
+                        # Even if not connected, calling disconnect() is safe, but may raise DBus errors.
+                        try:
+                            await client.disconnect()
+                        except Exception:
+                            pass
+                except Exception as e:
+                    if "UnknownObject" in str(e):
+                        # This is fine — it just means BlueZ already removed the device entry.
+                        self.get_logger().warn("[BLE] Device already gone (DBus UnknownObject). Continuing...")
+                    else:
+                        self.get_logger().error(f"[BLE] Error during disconnect: {e}")
 
             if not rclpy.ok():
                 break
