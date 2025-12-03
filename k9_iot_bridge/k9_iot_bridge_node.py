@@ -86,7 +86,7 @@ class BleBridge(Node):
 
         # ---------- Parameters ----------
         # Bangle BLE address (use your Bangle's MAC here or override via params)
-        self.declare_parameter("ble_address", "AA:BB:CC:DD:EE:FF")
+        self.declare_parameter("ble_address", "E5:5D:2D:CE:6E:E7")
 
         # Service / characteristic UUIDs for joystick data.
         # Defaults to Nordic UART Service TX characteristic.
